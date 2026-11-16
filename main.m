@@ -7,12 +7,14 @@
 
 #import <UIKit/UIKit.h>
 #import <mach/mach.h>
-#import <servers/bootstrap.h>
 #import <IOKit/IOKitLib.h>
 #import <pthread.h>
 #import <stdatomic.h>
 #import <sys/stat.h>
 #import <dirent.h>
+
+extern kern_return_t bootstrap_look_up(mach_port_t bp, const char *service_name, mach_port_t *sp);
+extern mach_port_t bootstrap_port;
 
 #define IOSURFACE_ROOT_SERVICE "IOSurfaceRoot"
 #define SELECTOR_CREATE_SURFACE        0
