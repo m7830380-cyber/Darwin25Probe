@@ -68,8 +68,12 @@ static void appendLog(NSString *text) {
     });
 }
 
+#ifndef kIOMainPortDefault
+#define kIOMainPortDefault MACH_PORT_NULL
+#endif
+
 static io_connect_t open_iosurface(void) {
-    io_service_t service = IOServiceGetMatchingService(kIOMasterPortDefault,
+    io_service_t service = IOServiceGetMatchingService(kIOMainPortDefault,
                                                        IOServiceMatching(IOSURFACE_ROOT_SERVICE));
     if (!service) return MACH_PORT_NULL;
     io_connect_t connect = MACH_PORT_NULL;
