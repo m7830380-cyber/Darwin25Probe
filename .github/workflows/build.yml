@@ -1,0 +1,36 @@
+name: Build Darwin25Probe IPA
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build IPA
+        run: |
+          chmod +x build.sh
+          ./build.sh
+
+      - name: Upload IPA Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Darwin25Probe-IPA
+          path: Darwin25Probe.ipa
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: release-${{ github.run_number }}
+          name: "Darwin25Probe Build #${{ github.run_number }}"
+          body: "Automated build of Darwin25Probe IPA for Darwin 25.6.0 / A18 Pro."
+          files: Darwin25Probe.ipa
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
