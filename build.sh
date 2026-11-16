@@ -15,6 +15,7 @@ clang -arch arm64 -arch arm64e \
     -framework UIKit \
     -framework Foundation \
     -framework IOKit \
+    -framework IOSurface \
     -fobjc-arc \
     -O2 \
     main.m \

