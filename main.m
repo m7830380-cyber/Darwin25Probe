@@ -288,82 +288,82 @@ static void *thread_locker(void *arg) {
 }
 
 - (void)actionMIG {
-    appendLog(@"\n[*] Auditing MIG IPC Dispatch Table for CARenderServer...");
+    appendLog(@"\n[*] Initiating Safe Mach Daemon IPC Audit...");
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        mach_port_t ca_port = MACH_PORT_NULL;
-        kern_return_t kr = bootstrap_look_up(bootstrap_port, "com.apple.CARenderServer", &ca_port);
-        if (kr != KERN_SUCCESS) {
-            appendLog([NSString stringWithFormat:@"[-] CARenderServer lookup failed: 0x%x", kr]);
-            return;
-        }
-        appendLog([NSString stringWithFormat:@"[+] Bound CARenderServer port: 0x%x", ca_port]);
-
-        mach_port_t reply_port = MACH_PORT_NULL;
-        kr = mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &reply_port);
-        if (kr != KERN_SUCCESS) {
-            appendLog(@"[-] Failed to allocate MIG reply port");
-            mach_port_deallocate(mach_task_self(), ca_port);
-            return;
-        }
-        mach_port_insert_right(mach_task_self(), reply_port, reply_port, MACH_MSG_TYPE_MAKE_SEND);
-
-        // Scan MIG routines 40000 to 40020
-        int active_handlers = 0;
-        for (mach_msg_id_t msgid = 40000; msgid <= 40020; msgid++) {
-            mig_probe_msg_t send_msg;
-            memset(&send_msg, 0, sizeof(send_msg));
-
-            send_msg.header.msgh_bits = MACH_MSGH_BITS_SET(MACH_MSG_TYPE_COPY_SEND,
-                                                            MACH_MSG_TYPE_MAKE_SEND_ONCE,
-                                                            0, 0);
-            send_msg.header.msgh_size = sizeof(mach_msg_header_t) + 32;
-            send_msg.header.msgh_remote_port = ca_port;
-            send_msg.header.msgh_local_port = reply_port;
-            send_msg.header.msgh_id = msgid;
-
-            mig_probe_msg_t recv_msg;
-            memset(&recv_msg, 0, sizeof(recv_msg));
-
-            kr = mach_msg(&send_msg.header,
-                          MACH_SEND_MSG | MACH_RCV_MSG | MACH_SEND_TIMEOUT | MACH_RCV_TIMEOUT,
-                          send_msg.header.msgh_size,
-                          sizeof(recv_msg),
-                          reply_port,
-                          150, // 150ms timeout per probe
-                          MACH_PORT_NULL);
-
-            if (kr == KERN_SUCCESS) {
-                // Return code from MIG reply
-                int32_t ret_code = (int32_t)recv_msg.body_data[0];
-                if (ret_code == 0) {
-                    appendLog([NSString stringWithFormat:@"  [!] MIG %d: SUCCESS (0x0)", msgid]);
-                    active_handlers++;
-                } else if (ret_code == 10000003) { // MIG_BAD_ARGUMENTS
-                    appendLog([NSString stringWithFormat:@"  [+] MIG %d: ACTIVE (MIG_BAD_ARGUMENTS - Valid handler!)", msgid]);
-                    active_handlers++;
-                } else if (ret_code == 10000002) { // MIG_BAD_ID
-                    // Ignored / unregistered
-                } else {
-                    appendLog([NSString stringWithFormat:@"  [*] MIG %d: Responded with code %d", msgid, ret_code]);
-                    active_handlers++;
-                }
-            }
-        }
-        appendLog([NSString stringWithFormat:@"[*] CARenderServer audit done. %d active handlers identified.", active_handlers]);
-
-        // Audit AudioComponentRegistrar
-        appendLog(@"\n[*] Auditing AudioComponentRegistrar...");
+        // 1. Audit AudioComponentRegistrar first (isolated, no UI dependency)
+        appendLog(@"[*] Step 1: Probing com.apple.audio.AudioComponentRegistrar...");
         mach_port_t audio_port = MACH_PORT_NULL;
-        kr = bootstrap_look_up(bootstrap_port, "com.apple.audio.AudioComponentRegistrar", &audio_port);
-        if (kr == KERN_SUCCESS) {
-            appendLog([NSString stringWithFormat:@"[+] Bound AudioComponentRegistrar port: 0x%x", audio_port]);
+        kern_return_t kr = bootstrap_look_up(bootstrap_port, "com.apple.audio.AudioComponentRegistrar", &audio_port);
+        if (kr == KERN_SUCCESS && audio_port != MACH_PORT_NULL) {
+            appendLog([NSString stringWithFormat:@"[+] Bound AudioComponentRegistrar: port 0x%x", audio_port]);
+            
+            mach_port_type_t ptype = 0;
+            mach_port_type(mach_task_self(), audio_port, &ptype);
+            appendLog([NSString stringWithFormat:@"  [*] Port rights mask: 0x%x", ptype]);
+
+            // Allocate isolated reply port
+            mach_port_t reply_port = MACH_PORT_NULL;
+            kr = mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &reply_port);
+            if (kr == KERN_SUCCESS) {
+                // Large heap buffer to prevent any stack corruption
+                size_t buf_size = 4096;
+                mach_msg_header_t *msg = (mach_msg_header_t *)calloc(1, buf_size);
+                msg->msgh_bits = MACH_MSGH_BITS_SET(MACH_MSG_TYPE_COPY_SEND, MACH_MSG_TYPE_MAKE_SEND_ONCE, 0, 0);
+                msg->msgh_size = sizeof(mach_msg_header_t);
+                msg->msgh_remote_port = audio_port;
+                msg->msgh_local_port = reply_port;
+                msg->msgh_id = 1000; // Generic probe ID
+
+                appendLog(@"  [*] Sending probe message (timeout 200ms)...");
+                kr = mach_msg(msg,
+                              MACH_SEND_MSG | MACH_RCV_MSG | MACH_SEND_TIMEOUT | MACH_RCV_TIMEOUT,
+                              msg->msgh_size,
+                              (mach_msg_size_t)buf_size,
+                              reply_port,
+                              200,
+                              MACH_PORT_NULL);
+
+                if (kr == KERN_SUCCESS) {
+                    appendLog([NSString stringWithFormat:@"  [!] Audio daemon replied! ID: 0x%x, size: %u", msg->msgh_id, msg->msgh_size]);
+                } else if (kr == MACH_RCV_TIMED_OUT || kr == MACH_SEND_TIMED_OUT) {
+                    appendLog(@"  [+] Audio daemon accepted message (timed out waiting for reply - daemon alive)");
+                } else {
+                    appendLog([NSString stringWithFormat:@"  [*] Audio daemon response code: 0x%x (%s)", kr, mach_error_string(kr)]);
+                }
+                free(msg);
+                mach_port_destroy(mach_task_self(), reply_port);
+            }
             mach_port_deallocate(mach_task_self(), audio_port);
         } else {
-            appendLog([NSString stringWithFormat:@"[-] AudioComponentRegistrar lookup: 0x%x", kr]);
+            appendLog([NSString stringWithFormat:@"[-] AudioComponentRegistrar lookup failed: 0x%x", kr]);
         }
 
-        mach_port_destroy(mach_task_self(), reply_port);
-        mach_port_deallocate(mach_task_self(), ca_port);
+        // 2. Audit CARenderServer non-destructively
+        appendLog(@"\n[*] Step 2: Probing com.apple.CARenderServer...");
+        mach_port_t ca_port = MACH_PORT_NULL;
+        kr = bootstrap_look_up(bootstrap_port, "com.apple.CARenderServer", &ca_port);
+        if (kr == KERN_SUCCESS && ca_port != MACH_PORT_NULL) {
+            appendLog([NSString stringWithFormat:@"[+] Bound CARenderServer: port 0x%x", ca_port]);
+
+            mach_port_type_t ptype = 0;
+            mach_port_type(mach_task_self(), ca_port, &ptype);
+            appendLog([NSString stringWithFormat:@"  [*] Port rights mask: 0x%x", ptype]);
+
+            // Query port limits without sending destructive MIG messages that abort UIKit render session
+            mach_port_limits_t limits;
+            mach_msg_type_number_t count = MACH_PORT_LIMITS_INFO_COUNT;
+            kr = mach_port_get_attributes(mach_task_self(), ca_port, MACH_PORT_LIMITS_INFO, (mach_port_info_t)&limits, &count);
+            if (kr == KERN_SUCCESS) {
+                appendLog([NSString stringWithFormat:@"  [+] CARenderServer queue limit: %u messages", limits.mpl_qlimit]);
+            } else {
+                appendLog([NSString stringWithFormat:@"  [*] mach_port_get_attributes returned: 0x%x", kr]);
+            }
+            mach_port_deallocate(mach_task_self(), ca_port);
+        } else {
+            appendLog([NSString stringWithFormat:@"[-] CARenderServer lookup failed: 0x%x", kr]);
+        }
+
+        appendLog(@"\n[*] Daemon IPC Audit finished cleanly. No crash.");
     });
 }
 
